@@ -95,7 +95,6 @@ gmsh.model.mesh.generate(2)
 # #
 # gmsh.fltk.run()
 
-# # 保存
 # gmsh.write("dumbbell_structured.msh")
 # %%
 gmsh_model_rank = 0
