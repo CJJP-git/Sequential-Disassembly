@@ -1,9 +1,14 @@
-
 import numpy as np
 import ufl
 
+import os
+
+path = "/Users/jipengcui/Documents/0. PhD/2. Research/Sequential-Disassembly/Results/Opt"
+os.makedirs(path, exist_ok=True)
+
 from mpi4py import MPI
 from dolfinx.io import gmshio
+from dolfinx.io import XDMFFile
 import gmsh
 from dolfinx import fem, io, nls
 from dolfinx import plot
@@ -100,7 +105,12 @@ gmsh.model.mesh.generate(2)
 gmsh_model_rank = 0
 mesh_comm = MPI.COMM_WORLD
 msh, cell_markers, facet_markers = gmshio.model_to_mesh(gmsh.model, mesh_comm, gmsh_model_rank, gdim=2)
+
 gmsh.finalize()
+msh = create_rectangle(    comm=MPI.COMM_WORLD,
+    points=[[0.0, 0.0], [10.0, 1.0]],
+    n=[100, 10],
+    cell_type=CellType.quadrilateral)
 dim = msh.topology.dim
 print(f"Mesh: {msh.name} with {msh.topology.index_map(dim).size_local} element in {dim}D")
 
@@ -113,24 +123,26 @@ u = fem.Function(V,name="Displacement")
 T_s= fem.functionspace(msh, ("CG", 1)) # Define the scalar function space for the theta
 v = TestFunction(V)
 du = TrialFunction(V)
+theta = fem.Function(T_s, name="theta")
+theta.x.array[:] = 2 * np.pi * np.random.random(size=theta.x.array.shape)  # Initialize theta to zero
 dtheta = ufl.TrialFunction(T_s)
 
 
 # Define the mechanical properties
-E = 1.0
+E = 1.0e3
 nu = 0.3
 G = fem.Constant(msh,E / (2.0 * (1.0 + nu)))
 K = fem.Constant(msh,E / (3.0 * (1.0 - 2.0 * nu)))
-mu0 = fem.Constant(msh,1.00e2)
+mu0 = fem.Constant(msh,np.pi*4.00e-10)
 
 # Define the design variable
-theta = fem.Function(T_s, name="theta")
-B_0 = fem.Constant(msh, PETSc.ScalarType(1.0))
+
+B_0 = fem.Constant(msh, PETSc.ScalarType(1e-3))
 B_tilde = B_0* as_vector([cos(theta), sin(theta)])
 
 
 # Define the load
-B_applied = fem.Constant(msh, np.array([0.0, -1.0e-3], dtype=np.float64))
+B_applied = fem.Constant(msh, np.array([0.0, -5e-6], dtype=np.float64))
 
 # Define the constitutive model
 
@@ -157,61 +169,93 @@ dpdtheta = derivative(P, theta, dtheta)
 # Define boundary conditions
 left = lambda x: np.isclose(x[0], 0.0)
 bc_1 = fem.dirichletbc(np.array([0.0, 0.0]), fem.locate_dofs_geometrical(V, left),V)
-right = lambda x: np.isclose(x[0], 25.0)
-bc_2 = fem.dirichletbc(np.array([-1.0, 0.0]), fem.locate_dofs_geometrical(V, right),V)
+right = lambda x: np.isclose(x[0], 10.0)
+bc_2 = fem.dirichletbc(np.array([0.0, 0.0]), fem.locate_dofs_geometrical(V, right),V)
+bc = [bc_1, bc_2]
 
-# Define the solution function
+xdmf_theta = XDMFFile(msh.comm, os.path.join(path, "results_theta.xdmf"), "w")
+xdmf_u = XDMFFile(msh.comm, os.path.join(path, "results_u.xdmf"), "w")
+xdmf_theta.write_mesh(msh)
+xdmf_u.write_mesh(msh)
 
-def solve_problem(u):
-    # Create the linear problem
-    problem = fem.petsc.NonlinearProblem(Residual, u, [bc_1,bc_2], Jacobian)
+# Optimization loop
+n_steps = 100
+alpha = 1e4
+
+# Select all y-DoFs within 0.5 units of the midpoint (1.0, 0.5)
+center = np.array([5.0, 0.0])
+radius = 0.1
+dofs_y = fem.locate_dofs_geometrical(
+    (V.sub(1), T_s),
+    lambda x: np.linalg.norm(x[:2] - center[:, np.newaxis], axis=0) < radius
+)
+
+for step in range(n_steps):
+    print(f"\n--- Optimization step {step} ---")
+
+    # Reset u
+    u.x.array[:] = 0.0
+
+    # Redefine field-dependent expressions
+    F = Identity(dim) + grad(u)
+    J = det(F)
+    C = F.T * F
+    I1 = tr(C)
+    P = G*J**(-2/3)*(F-I1/2*inv(F).T) + K*J*(J-1)*inv(F).T - 1/mu0*outer(B_applied,B_tilde)
+
+    # Residual and Jacobian
+    Residual = inner(P, grad(v))*dx
+    Jacobian = derivative(Residual, u, du)
+
+    # Solve the state problem
+    problem = fem.petsc.NonlinearProblem(Residual, u, bc, Jacobian)
     solver = nls.petsc.NewtonSolver(msh.comm, problem)
-    # Set Newton solver options
     solver.atol = 1e-4
     solver.rtol = 1e-4
-    solver.max_it = 10000
+    solver.max_it = 100
     solver.convergence_criterion = "incremental"
-    solver.solve(u) 
-    return u
+    solver.solve(u)
 
-# Define Dirac 
-x_target = np.array([5.0, 2.5], dtype=np.float64)
-cells = locate_entities(msh, dim, marker=lambda x: np.isclose(x[0], x_target[0]) & np.isclose(x[1], x_target[1]))
-cells_tag = meshtags(msh, dim, cells, np.full(len(cells), 1, dtype=np.int32))
-dx_sub = ufl.Measure("dx", domain=msh, subdomain_data=cells_tag)
+    # Create selection function w
+    w = fem.Function(V)
+    w.x.array[:] = 0.0
+    w.x.array[dofs_y[0]] = 1.0
 
-# Initialize the optimization loop
-theta.x.array[:] = np.pi / 6  # Reset theta to initial guess
-u.x.array[:] = 0.0  # Reset the displacement field
-# Record the last step
-u_last = u.copy()
-# Solve the problem
-u = solve_problem(u)
+    # Define objective
+    phi = inner(u, w) * dx
+    dphi_dtheta = derivative(phi, theta, dtheta)
+    dR_dtheta = derivative(Residual, theta, dtheta)
+    dR_du = derivative(Residual, u, du)
 
-# Compute the objective function
-phi = ufl.inner(u[0], fem.Constant(msh, PETSc.ScalarType(1))) * dx_sub(1)
+    # Solve adjoint problem
+    A = fem.petsc.assemble_matrix(fem.form(dR_du), bcs=bc)
+    A.assemble()
+    b_form = fem.form(inner(w, v) * dx)
+    b = -fem.petsc.assemble_vector(b_form)
+    fem.petsc.apply_lifting(b, [fem.form(dR_du)], [bc])
+    b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+    fem.petsc.set_bc(b, bc)
+    lamda_sol = fem.Function(V)
+    ksp = PETSc.KSP().create(msh.comm)
+    ksp.setOperators(A)
+    ksp.setType(PETSc.KSP.Type.PREONLY)
+    ksp.getPC().setType(PETSc.PC.Type.LU)
+    ksp.solve(b, lamda_sol.x.petsc_vec)
 
-dphi_dtheta = ufl.derivative(phi, theta, dtheta)
-dR_dtheta = ufl.derivative(Residual, theta, dtheta)
+    # Compute gradient
+    adj_term = ufl.replace(dR_dtheta, {v: lamda_sol})
+    dL_dtheta = dphi_dtheta + adj_term
+    grad_theta = fem.petsc.assemble_vector(fem.form(dL_dtheta))
+    grad_theta.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
 
-# Define the adjoint problem
-lambda_ = TrialFunction(V)
-v_t = TestFunction(V)
-dphi_du = derivative(derivative(phi, u, du), u, v_t)
-dR_du = -derivative(Residual, u, du)
-A = fem.petsc.assemble_matrix(fem.form(dphi_du),diagonal=True)
-A.assemble()
-b = fem.petsc.assemble_vector(fem.form(dR_du))
+    # Update theta
+    theta.x.array[:] -= alpha * grad_theta.array
 
-# Solve the adjoint problem
-solver = PETSc.KSP().create(msh.comm)
-solver.setOperators(A)
-solver.setType(PETSc.KSP.Type.PREONLY)
-solver.getPC().setType(PETSc.PC.Type.LU)  # AMG
-fem.petsc.apply_lifting(b, [fem.form(dphi_du)], [[bc_1, bc_2]])
-b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-fem.petsc.set_bc(b, [bc_1, bc_2])
+    # Write current theta and u to XDMF files
+    xdmf_theta.write_function(theta, step)
+    xdmf_u.write_function(u, step)
 
+    print("Current displacement at target point:", u.x.array[dofs_y[0]])
 
-lamda_sol = fem.Function(V)
-solver.solve(b, lamda_sol.x.petsc_vec)
+xdmf_theta.close()
+xdmf_u.close()
